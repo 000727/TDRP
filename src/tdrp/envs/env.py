@@ -217,6 +217,11 @@ class TruckMultiDroneCleanEnv(gym.Env):
         for tid in range(sc.ntasks):
             if float(sc.task_spawn_time[tid]) <= cfg.eps_time:
                 self._task_spawned[tid] = 1
+            elif not cfg.dynamic_generate_online:
+                result = self._scenario_gen.generate_task_slot(
+                    sc, int(tid), float(sc.task_spawn_time[tid]), self.np_random)
+                if result is not None:
+                    self._apply_generated_task_slot(int(tid), result)
 
         self._build_task_action_map()
 
@@ -368,13 +373,17 @@ class TruckMultiDroneCleanEnv(gym.Env):
             self.scenario, tid, float(self.t), self.np_random)
         if result is None:
             return False
+        self._apply_generated_task_slot(tid, result)
+        self._precompute_task_stop_dists()
+        return True
+
+    def _apply_generated_task_slot(self, tid: int, result: Dict) -> None:
+        """Apply generated future-task geometry to mutable env-state buffers."""
         self._point_service_remain[tid] = float(result["point_service_remain"])
         self._line_remain_xy[tid] = result["line_remain_xy"]
         self._line_remain_npts[tid] = int(result["line_remain_npts"])
         self._line_remain_len[tid] = float(result["line_remain_len"])
         self._line_len[tid] = float(result["line_len"])
-        self._precompute_task_stop_dists()
-        return True
 
     # ------------------------------------------------------------------ uncertainty
 
