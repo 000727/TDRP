@@ -1,4 +1,4 @@
-[project]
+﻿[project]
 name = "tdrp"
 version = "0.1.0"
 description = "Vehicle-UAV collaborative path planning under uncertainty"
@@ -9,6 +9,7 @@ dependencies = [
     "scipy>=1.10",
     "pandas>=2.0",
     "pyyaml>=6.0",
+    "gymnasium>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +20,7 @@ dev = [
 ]
 rl = [
     "torch>=2.0",
-    "gymnasium>=0.29",
+    "wandb>=0.16",
 ]
 
 [tool.hatch.build.targets.wheel]

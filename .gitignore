@@ -18,3 +18,10 @@ wandb/
 *.pt
 *.pth
 *.ckpt
+
+.idea/
+.claude/
+algorithms/wandb/
+src/__pycache__/
+src/envs/__pycache__/
+checkpoints*/

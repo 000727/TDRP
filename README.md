@@ -1,43 +1,55 @@
-# TDRP
+﻿# TDRP
 
-TDRP is a research codebase for vehicle-UAV collaborative path planning under uncertainty. The project focuses on building simulation environments and reinforcement learning algorithms for coordinated routing decisions when travel time, service time, demand, communication, or environment dynamics are uncertain.
+TDRP is a research codebase for vehicle-UAV collaborative path planning under uncertainty. The project focuses on simulation environments and reinforcement learning algorithms for coordinated routing decisions when travel time, service time, task appearance, wind, battery behavior, and payload reliability are uncertain.
 
 ## Research Scope
 
 - Vehicle-UAV collaborative routing and task allocation.
 - Simulation environment design for coupled ground-air operations.
-- Uncertainty modeling for travel time, demand, availability, and disturbances.
+- Uncertainty modeling for wind, battery shock, payload degradation, dynamic tasks, deadlines, and heterogeneous task risk.
 - Reinforcement learning algorithms for robust and adaptive decision-making.
 - Benchmarking against heuristic, optimization, and learning-based baselines.
 
-## Initial Architecture
+## Current Implementation
+
+The repository now includes an initial simulation environment migrated from the local project:
+
+- `TruckMultiDroneCleanEnv`: Gymnasium-compatible truck-multi-drone environment.
+- Scenario generation for point and line tasks.
+- Heterogeneous task priority, deadline, reward weight, service factor, and risk attributes.
+- Uncertainty components for wind, battery shock, and payload degradation.
+- Event-driven state transitions for truck movement, drone takeoff/landing, task execution, swaps, and dynamic task spawning.
+- A Maskable PPO training script under `src/tdrp/algorithms/`.
+
+## Repository Layout
 
 ```text
 configs/                 Experiment and environment configuration files
 docs/                    Project notes, design decisions, and research plans
-experiments/             Runnable experiment entry points and result scripts
-src/tdrp/                Core Python package
-tests/                   Unit and smoke tests
-```
-
-Core package layout:
-
-```text
-src/tdrp/envs/           Simulation environments and state transitions
-src/tdrp/uncertainty/    Stochastic scenario generators and uncertainty models
+src/tdrp/envs/           Simulation environment, configs, constants, scenarios, wind model
+src/tdrp/uncertainty/    Future uncertainty model abstractions
 src/tdrp/algorithms/     RL policies, trainers, and baselines
 src/tdrp/evaluation/     Metrics, rollout evaluation, and comparisons
 src/tdrp/utils/          Shared utilities
+tests/                   Unit and smoke tests
 ```
 
-## Near-Term Goals
+## Install
 
-1. Define the first formal problem setting.
-2. Implement a small vehicle-UAV simulation environment.
-3. Add uncertainty models and reproducible scenario generation.
-4. Build baseline dispatch/routing heuristics.
-5. Add a first RL training loop and evaluation protocol.
+```powershell
+python -m pip install -e .[dev]
+```
 
-## Development Status
+For RL training dependencies:
 
-This repository is at the project-initialization stage. The first priority is to stabilize the problem definition and simulator API before implementing complex training algorithms.
+```powershell
+python -m pip install -e .[dev,rl]
+```
+
+## Next Steps
+
+1. Add smoke tests for `TruckMultiDroneCleanEnv.reset()` and action masks.
+2. Refactor the PPO script into smaller trainer/model/rollout modules.
+3. Create reproducible experiment entry points under `experiments/`.
+4. Add baseline heuristic policies.
+5. Add evaluation scripts for deterministic and uncertainty-shifted scenarios.
