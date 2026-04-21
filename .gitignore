@@ -25,3 +25,4 @@ algorithms/wandb/
 src/__pycache__/
 src/envs/__pycache__/
 checkpoints*/
+_legacy_untracked_*/
