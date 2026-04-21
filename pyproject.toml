@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "tdrp"
 version = "0.1.0"
 description = "Vehicle-UAV collaborative path planning under uncertainty"
@@ -6,9 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
-    "scipy>=1.10",
-    "pandas>=2.0",
-    "pyyaml>=6.0",
     "gymnasium>=0.29",
 ]
 
@@ -17,6 +14,11 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.4",
     "black>=24.0",
+]
+analysis = [
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
 ]
 rl = [
     "torch>=2.0",

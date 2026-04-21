@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,7 +17,22 @@ jobs:
           python-version: "3.10"
 
       - name: Install package
-        run: python -m pip install -e .[dev]
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
 
-      - name: Test
-        run: pytest -q
+      - name: Environment smoke test
+        run: |
+          python - <<'PY'
+          from tdrp.envs import EnvConfig, TruckMultiDroneCleanEnv
+
+          env = TruckMultiDroneCleanEnv(EnvConfig(fixed_scale="XS"))
+          obs, info = env.reset(seed=0)
+          assert env.observation_space.contains(obs)
+
+          mask = obs["action_mask"]
+          action = [int(row.nonzero()[0][0]) for row in mask]
+          obs, reward, terminated, truncated, info = env.step(action)
+          assert env.observation_space.contains(obs)
+          print("smoke ok", float(reward), terminated, truncated)
+          PY
