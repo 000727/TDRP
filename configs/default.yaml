@@ -1,0 +1,40 @@
+project:
+  name: TDRP
+  seed: 1234
+
+problem:
+  name: single_vehicle_single_uav
+  num_customers: 20
+  depot: [0.5, 0.5]
+
+simulation:
+  horizon: 200
+  vehicle_speed: 1.0
+  uav_speed: 1.5
+  uav_endurance: 30.0
+  service_time: 1.0
+
+uncertainty:
+  enabled: true
+  travel_time_model: lognormal
+  travel_time_cv: 0.15
+  demand_model: deterministic
+
+reward:
+  completion_time_weight: 1.0
+  lateness_penalty: 5.0
+  infeasible_penalty: 100.0
+  energy_penalty: 0.1
+
+algorithm:
+  name: heuristic_nearest
+  train: false
+
+evaluation:
+  num_instances: 100
+  num_rollouts_per_instance: 1
+  metrics:
+    - completion_time
+    - feasible_rate
+    - total_distance
+    - uav_utilization
