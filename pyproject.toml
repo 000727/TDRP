@@ -22,6 +22,12 @@ rl = [
     "gymnasium>=0.29",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/tdrp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/tdrp", "README.md", "pyproject.toml"]
+
 [tool.black]
 line-length = 90
 target-version = ["py310"]
