@@ -7,6 +7,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from ..rewards import build_reward_model
+from ..uncertainty import build_uncertainty_modules
 from .configs import EnvConfig, Scenario
 from .constants import (
     DS_CRUISING, DS_EXECUTING, DS_LANDING, DS_ON_GROUND, DS_ON_TRUCK,
@@ -19,7 +21,6 @@ from .constants import (
     TASK_LINE, TASK_POINT,
 )
 from .scenario_gen import ScenarioGenerator, polyline_length
-from .wind import WindField
 
 
 class TruckMultiDroneCleanEnv(gym.Env):
@@ -71,6 +72,7 @@ class TruckMultiDroneCleanEnv(gym.Env):
             "task_priority": spaces.Box(0.0, 1.0, (MAX_TASKS,), dtype=np.float32),
             "task_deadline_h": spaces.Box(0.0, 1.0, (MAX_TASKS,), dtype=np.float32),
             "task_reward_weight": spaces.Box(0.0, 4.0, (MAX_TASKS,), dtype=np.float32),
+            "task_urgency": spaces.Box(0.0, 1.0, (MAX_TASKS,), dtype=np.float32),
             "task_service_factor": spaces.Box(0.0, 2.0, (MAX_TASKS,), dtype=np.float32),
             "task_risk": spaces.Box(0.0, 1.0, (MAX_TASKS,), dtype=np.float32),
 
@@ -105,6 +107,8 @@ class TruckMultiDroneCleanEnv(gym.Env):
         })
 
         self._scenario_gen = ScenarioGenerator(cfg)
+        self.reward_model = build_reward_model(cfg)
+        self._uncertainty_modules = []
 
         self.scenario: Optional[Scenario] = None
         self.np_random: Optional[np.random.Generator] = None
@@ -377,6 +381,15 @@ class TruckMultiDroneCleanEnv(gym.Env):
         self._precompute_task_stop_dists()
         return True
 
+    def _spawn_dynamic_task_from_modules(self, tid: int) -> bool:
+        for module in self._uncertainty_modules:
+            result = module.on_new_task_spawn(self, int(tid))
+            if result is not None:
+                if bool(result):
+                    self._precompute_task_stop_dists()
+                return bool(result)
+        return self._generate_future_task_into_slot(tid)
+
     def _apply_generated_task_slot(self, tid: int, result: Dict) -> None:
         """Apply generated future-task geometry to mutable env-state buffers."""
         self._point_service_remain[tid] = float(result["point_service_remain"])
@@ -388,29 +401,20 @@ class TruckMultiDroneCleanEnv(gym.Env):
     # ------------------------------------------------------------------ uncertainty
 
     def _init_uncertainty_state(self) -> None:
-        unc = self.cfg.uncertainty
-        if unc.enabled and unc.wind_enabled and unc.wind_intensity > 0:
-            sigma = max(0.01, float(unc.wind_sigma_frac) * float(self.scenario.map_range))
-            ou_sigma_eff = float(unc.wind_ou_sigma) * float(unc.wind_intensity)
-            self._wind_field = WindField(
-                map_range=self.scenario.map_range,
-                n_kernels=N_WIND_KERNELS,
-                sigma=sigma,
-                ou_theta=float(unc.wind_ou_theta),
-                ou_sigma=ou_sigma_eff,
-                max_speed=float(unc.wind_max_speed),
-                rng=self._unc_rng,
-            )
-        else:
-            self._wind_field = None
-        self._drone_payload_remain[:] = float(unc.payload_lifetime_h)
-        self._drone_sortie_start_t[:] = 0.0
-        self._drone_payload_failed[:] = False
+        self._wind_field = None
+        self._uncertainty_modules = build_uncertainty_modules(self.cfg)
+        for module in self._uncertainty_modules:
+            if hasattr(module, "bind"):
+                module.bind(self)
+            module.on_reset(self)
+        if hasattr(self.reward_model, "on_reset"):
+            self.reward_model.on_reset(self)
 
     def _update_wind(self, dt: float) -> None:
-        if self._wind_field is None or dt < self.cfg.eps_time:
+        if dt < self.cfg.eps_time:
             return
-        self._wind_field.advance(dt)
+        for module in self._uncertainty_modules:
+            module.on_time_advance(self, float(dt))
 
     def _wind_at(self, xy: np.ndarray) -> np.ndarray:
         if self._wind_field is None:
@@ -419,7 +423,7 @@ class TruckMultiDroneCleanEnv(gym.Env):
 
     def _effective_flight_time(self, from_xy: np.ndarray, to_xy: np.ndarray,
                                base_speed: Optional[float] = None) -> float:
-        cfg, unc = self.cfg, self.cfg.uncertainty
+        cfg = self.cfg
         base_speed = cfg.drone_speed_kmph if base_speed is None else base_speed
         from_xy = np.asarray(from_xy, dtype=np.float64)
         to_xy = np.asarray(to_xy, dtype=np.float64)
@@ -427,49 +431,58 @@ class TruckMultiDroneCleanEnv(gym.Env):
         dist = float(np.linalg.norm(vec))
         if dist < 1e-9:
             return 0.0
-        if self._wind_field is None or not (unc.enabled and unc.wind_enabled and unc.wind_intensity > 0):
-            return dist / base_speed
-        mid = 0.5 * (from_xy + to_xy)
-        wind = self._wind_at(mid)
-        direction = vec / dist
-        wind_along = float(np.dot(wind, direction))
-        eff_speed = max(base_speed + wind_along, base_speed * float(unc.wind_speed_floor))
-        return dist / eff_speed
+        current = float(dist / base_speed)
+        for module in self._uncertainty_modules:
+            current = module.flight_time(self, from_xy, to_xy, float(base_speed), current)
+        return float(current)
 
     def _effective_hover_power(self, xy: np.ndarray) -> float:
-        cfg, unc = self.cfg, self.cfg.uncertainty
-        if self._wind_field is None or not (unc.enabled and unc.wind_enabled and unc.wind_intensity > 0):
-            return cfg.hover_power_per_h
-        wind = self._wind_at(xy)
-        wind_speed = float(np.linalg.norm(wind))
-        return cfg.hover_power_per_h * (1.0 + float(unc.wind_hover_k) *
-                                        wind_speed / max(float(unc.wind_max_speed), 1e-9))
+        current = float(self.cfg.hover_power_per_h)
+        for module in self._uncertainty_modules:
+            current = module.hover_power(self, xy, current)
+        return float(current)
+
+    def _effective_flight_power(
+        self,
+        from_xy: np.ndarray,
+        to_xy: np.ndarray,
+        base_power: Optional[float] = None,
+    ) -> float:
+        base_power = self.cfg.fly_power_per_h if base_power is None else float(base_power)
+        current = float(base_power)
+        for module in self._uncertainty_modules:
+            current = module.flight_power(self, from_xy, to_xy, float(base_power), current)
+        return float(current)
+
+    def _flight_energy(
+        self,
+        from_xy: np.ndarray,
+        to_xy: np.ndarray,
+        base_speed: Optional[float] = None,
+        base_power: Optional[float] = None,
+    ) -> float:
+        return float(self._effective_flight_time(from_xy, to_xy, base_speed)) * float(
+            self._effective_flight_power(from_xy, to_xy, base_power)
+        )
 
     def _apply_battery_shock(self, d: int) -> float:
-        unc = self.cfg.uncertainty
-        if not (unc.enabled and unc.battery_enabled and unc.battery_intensity > 0):
-            return 0.0
-        std = float(unc.battery_shock_std) * float(unc.battery_intensity)
-        shock = float(abs(self._unc_rng.normal(0.0, std)))
-        self.drone_batt[d] = max(0.0, float(self.drone_batt[d]) - shock)
-        self._invalidate_mask()
-        return shock
+        shock = 0.0
+        for module in self._uncertainty_modules:
+            result = module.on_takeoff(self, int(d)) or {}
+            shock += float(result.get("battery_shock", 0.0))
+        return float(shock)
 
     def _init_sortie_payload(self, d: int) -> None:
-        unc = self.cfg.uncertainty
-        base = float(unc.payload_lifetime_h)
-        if unc.enabled and unc.payload_enabled and unc.payload_intensity > 0:
-            base = max(1e-6, base + float(self._unc_rng.normal(
-                0.0, unc.payload_deg_std * unc.payload_intensity)))
-        self._drone_payload_remain[d] = base
-        self._drone_sortie_start_t[d] = float(self.t)
-        self._drone_payload_failed[d] = False
+        for module in self._uncertainty_modules:
+            module.on_sortie_start(self, int(d))
 
     def _check_payload_failure(self, d: int) -> bool:
-        unc = self.cfg.uncertainty
-        if not (unc.enabled and unc.payload_enabled and unc.payload_intensity > 0):
-            return False
-        return (float(self.t) - float(self._drone_sortie_start_t[d])) > float(self._drone_payload_remain[d])
+        failed = False
+        for module in self._uncertainty_modules:
+            result = module.payload_failed(self, int(d))
+            if result is not None:
+                failed = failed or bool(result)
+        return bool(failed)
 
     # ------------------------------------------------------------------ observation
 
@@ -515,6 +528,7 @@ class TruckMultiDroneCleanEnv(gym.Env):
         task_priority = np.zeros(MAX_TASKS, dtype=np.float32)
         task_deadline_h = np.zeros(MAX_TASKS, dtype=np.float32)
         task_reward_weight = np.zeros(MAX_TASKS, dtype=np.float32)
+        task_urgency = np.zeros(MAX_TASKS, dtype=np.float32)
         task_service_factor = np.zeros(MAX_TASKS, dtype=np.float32)
         task_risk = np.zeros(MAX_TASKS, dtype=np.float32)
 
@@ -530,6 +544,8 @@ class TruckMultiDroneCleanEnv(gym.Env):
             task_priority[:T] = np.clip(sc.task_priority[:T] / 3.0, 0.0, 1.0)
             task_deadline_h[:T] = normalize_01(sc.task_deadline_h[:T], sc.max_time_h)
             task_reward_weight[:T] = sc.task_reward_weight[:T].astype(np.float32)
+            urgency_ref = max(float(getattr(cfg, "critical_urgency_range", (0.5, 0.9))[1]), 1e-9)
+            task_urgency[:T] = np.clip(sc.task_urgency[:T] / urgency_ref, 0.0, 1.0).astype(np.float32)
             task_service_factor[:T] = sc.task_service_factor[:T].astype(np.float32)
             task_risk[:T] = np.clip(sc.task_risk[:T], 0.0, 1.0).astype(np.float32)
 
@@ -581,6 +597,7 @@ class TruckMultiDroneCleanEnv(gym.Env):
             "task_priority": task_priority,
             "task_deadline_h": task_deadline_h,
             "task_reward_weight": task_reward_weight,
+            "task_urgency": task_urgency,
             "task_service_factor": task_service_factor,
             "task_risk": task_risk,
             "task_done": task_done,
@@ -698,6 +715,22 @@ class TruckMultiDroneCleanEnv(gym.Env):
             sf = max(0.5, float(self.scenario.task_service_factor[tid]))
         return float(base * sf)
 
+    def _line_traverse_energy(self, tid: int, side: int) -> float:
+        pts = self._line_poly_points(tid)
+        if side == 1:
+            pts = pts[::-1].copy()
+        vline = self.cfg.drone_speed_kmph * self.cfg.line_speed_factor
+        base = float(
+            sum(
+                self._flight_energy(p0, p1, vline, self.cfg.fly_power_per_h)
+                for p0, p1 in zip(pts[:-1], pts[1:])
+            )
+        )
+        sf = 1.0
+        if 0 <= int(tid) < self.scenario.ntasks:
+            sf = max(0.5, float(self.scenario.task_service_factor[tid]))
+        return float(base * sf)
+
     def _payload_time_left(self, d: int) -> float:
         unc = self.cfg.uncertainty
         if not (unc.enabled and unc.payload_enabled and unc.payload_intensity > 0):
@@ -809,6 +842,13 @@ class TruckMultiDroneCleanEnv(gym.Env):
             best = min(best, self._effective_flight_time(xy, sc.stop_xy[s]))
         return 0.0 if not np.isfinite(best) else float(best)
 
+    def _nearest_stop_flight_energy(self, xy: np.ndarray) -> float:
+        sc = self.scenario
+        best = float('inf')
+        for s in range(sc.nstops):
+            best = min(best, self._flight_energy(xy, sc.stop_xy[s]))
+        return 0.0 if not np.isfinite(best) else float(best)
+
     def _task_local_density(self, ref_xy: np.ndarray, radius_km: float) -> float:
         sc = self.scenario
         cnt = 0.0
@@ -896,8 +936,8 @@ class TruckMultiDroneCleanEnv(gym.Env):
         if int(self.drone_status[d]) != DS_WAITING:
             return False
         cfg = self.cfg
-        t_fly = self._effective_flight_time(self._drone_xy[d], self.scenario.stop_xy[int(s)])
-        e_need = cfg.fly_power_per_h * (t_fly + cfg.landing_time_h) + cfg.safety_batt_margin
+        e_need = self._flight_energy(self._drone_xy[d], self.scenario.stop_xy[int(s)])
+        e_need += cfg.fly_power_per_h * cfg.landing_time_h + cfg.safety_batt_margin
         return float(self.drone_batt[d]) + cfg.eps_batt >= e_need
 
     def _task_action_feasible(self, d: int, tid: int, side: int) -> bool:
@@ -920,20 +960,20 @@ class TruckMultiDroneCleanEnv(gym.Env):
         takeoff_h = cfg.takeoff_time_h if status == DS_ON_TRUCK else 0.0
         batt = float(self.drone_batt[d])
         if int(sc.task_type[tid]) == TASK_POINT:
-            t_to = self._effective_flight_time(from_xy, sc.point_xy[tid])
-            e_need = cfg.fly_power_per_h * (takeoff_h + t_to)
+            e_need = cfg.fly_power_per_h * takeoff_h
+            e_need += self._flight_energy(from_xy, sc.point_xy[tid])
             e_need += self._effective_hover_power(sc.point_xy[tid]) * float(self._point_service_remain[tid])
-            ret = self._nearest_stop_flight_time(sc.point_xy[tid])
-            e_need += cfg.fly_power_per_h * (ret + cfg.landing_time_h)
+            e_need += self._nearest_stop_flight_energy(sc.point_xy[tid])
+            e_need += cfg.fly_power_per_h * cfg.landing_time_h
             e_need += cfg.safety_batt_margin
             return batt + cfg.eps_batt >= e_need
         entry, _ = self._line_entry_exit(tid, side)
-        t_to = self._effective_flight_time(from_xy, entry)
-        t_srv = self._line_traverse_time(tid, side)
         exit_xy = self._line_end_xy(tid) if side == 0 else self._line_start_xy(tid)
-        ret_t = self._nearest_stop_flight_time(exit_xy)
-        e_need = cfg.fly_power_per_h * (takeoff_h + t_to + t_srv)
-        e_need += cfg.fly_power_per_h * (ret_t + cfg.landing_time_h)
+        e_need = cfg.fly_power_per_h * takeoff_h
+        e_need += self._flight_energy(from_xy, entry)
+        e_need += self._line_traverse_energy(tid, side)
+        e_need += self._nearest_stop_flight_energy(exit_xy)
+        e_need += cfg.fly_power_per_h * cfg.landing_time_h
         e_need += cfg.safety_batt_margin
         return batt + cfg.eps_batt >= e_need
 
@@ -1319,10 +1359,16 @@ class TruckMultiDroneCleanEnv(gym.Env):
                 p = self._effective_hover_power(self._drone_xy[d])
             elif st == DS_EXECUTING:
                 p = self._effective_hover_power(self._drone_xy[d]) \
-                    if bool(self._drone_exec_is_hover[d]) else cfg.fly_power_per_h
+                    if bool(self._drone_exec_is_hover[d]) else self._effective_flight_power(
+                        self._seg_from_xy[d], self._seg_to_xy[d]
+                    )
             else:
-                p = cfg.fly_power_per_h
-            self.drone_batt[d] -= float(p) * float(dt)
+                p = self._effective_flight_power(self._seg_from_xy[d], self._seg_to_xy[d])
+            energy = float(p) * float(dt)
+            self.drone_batt[d] -= energy
+            self.step_events["energy_used"] = (
+                float(self.step_events.get("energy_used", 0.0)) + float(energy)
+            )
         return (False, "battery_depleted") if np.any(self.drone_batt < -cfg.eps_batt) else (True, "")
 
     # ------------------------------------------------------------------ actions
@@ -1447,7 +1493,7 @@ class TruckMultiDroneCleanEnv(gym.Env):
             if int(self._task_spawned[tid]) == 1:
                 return
             if cfg.dynamic_generate_online:
-                if not self._generate_future_task_into_slot(tid):
+                if not self._spawn_dynamic_task_from_modules(tid):
                     return
             self._task_spawned[tid] = 1
             self.episode_new_task_spawned += 1
@@ -1680,37 +1726,23 @@ class TruckMultiDroneCleanEnv(gym.Env):
 
     def _prepare_task_reward(self, d: int, tid: int, side: int) -> None:
         """Stash the weighted completion bonus for this task claim."""
-        cfg = self.cfg
-        ntasks = max(1, int(self.scenario.ntasks))
-        weight = 1.0
         if 0 <= int(tid) < self.scenario.ntasks:
-            weight = max(0.2, float(self.scenario.task_reward_weight[tid]))
-        self._pending_task_reward[d] = float(cfg.reward.task_done_bonus) * weight / float(ntasks)
+            self.step_events["risk_exposure"] = (
+                float(self.step_events.get("risk_exposure", 0.0))
+                + float(self.scenario.task_risk[int(tid)])
+            )
+        self.reward_model.prepare_task_claim(self, int(d), int(tid), int(side))
 
     def _task_deadline_adjustment(self, tid: int, completion_t: float) -> float:
-        if not (0 <= int(tid) < self.scenario.ntasks):
-            return 0.0
-        ddl = float(self.scenario.task_deadline_h[tid])
-        if ddl <= 0.0:
-            return 0.0
-        weight = max(0.2, float(self.scenario.task_reward_weight[tid]))
-        priority = max(1.0, float(self.scenario.task_priority[tid]))
-        gap = float(ddl) - float(completion_t)
-        if gap >= 0.0:
-            return float(self.cfg.reward.early_finish_coef) * weight * min(
-                gap / max(self.time_ref_h, 1e-6), 1.0)
-        return -float(self.cfg.reward.deadline_miss_coef) * weight * priority * min(
-            abs(gap) / max(self.time_ref_h, 1e-6), 1.0)
+        return float(self.reward_model.task_deadline_adjustment(
+            self, int(tid), float(completion_t)))
 
     def _clear_pending_task_reward(self, d: int) -> None:
-        self._pending_task_reward[d] = 0.0
+        self.reward_model.clear_pending_task_reward(self, int(d))
 
     def _compute_reward(self, dt: float) -> float:
         """Step reward = time penalty + task completion bonuses + rendezvous shaping."""
-        reward = -float(self.cfg.reward.time_coef) * float(self._norm_global_time(dt))
-        reward += float(self.step_events.get("task_reward", 0.0))
-        reward += float(self.step_events.get("rendezvous_reward", 0.0))
-        return float(reward)
+        return float(self.reward_model.compute(self, float(dt)))
 
     # ------------------------------------------------------------------ simulation advance
 
@@ -1798,6 +1830,10 @@ class TruckMultiDroneCleanEnv(gym.Env):
             self.t = float(self.t) + float(dt_next)
             if not ok:
                 extra["end_reason"] = reason
+                if reason == "battery_depleted":
+                    self.step_events["battery_depleted_count"] = (
+                        float(self.step_events.get("battery_depleted_count", 0.0)) + 1.0
+                    )
                 self._update_drone_xy()
                 return False, True, extra
             self._update_drone_xy()

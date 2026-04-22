@@ -15,11 +15,14 @@ TDRP is a research codebase for vehicle-UAV collaborative path planning under un
 The repository now includes an initial simulation environment migrated from the local project:
 
 - `TruckMultiDroneCleanEnv`: Gymnasium-compatible truck-multi-drone environment.
+- `MultiTruckMultiDroneEnv`: modular multi-truck, multi-drone turn-based skeleton.
 - Scenario generation for point and line tasks.
 - Heterogeneous task priority, deadline, reward weight, service factor, and risk attributes.
 - Uncertainty components for wind, battery shock, and payload degradation.
 - Event-driven state transitions for truck movement, drone takeoff/landing, task execution, swaps, and dynamic task spawning.
 - A Maskable PPO training script under `src/tdrp/algorithms/`.
+- Pluggable uncertainty modules and reward models for modular environment maintenance.
+- Built-in reward objectives for completion, deadline, energy-aware, and risk-sensitive studies.
 
 ## Repository Layout
 
@@ -27,7 +30,8 @@ The repository now includes an initial simulation environment migrated from the 
 configs/                 Experiment and environment configuration files
 docs/                    Project notes, design decisions, and research plans
 src/tdrp/envs/           Simulation environment, configs, constants, scenarios, wind model
-src/tdrp/uncertainty/    Future uncertainty model abstractions
+src/tdrp/uncertainty/    Pluggable wind, task-spawn, battery, and payload uncertainty modules
+src/tdrp/rewards/        Replaceable reward models for different research objectives
 src/tdrp/algorithms/     RL policies, trainers, and baselines
 src/tdrp/evaluation/     Metrics, rollout evaluation, and comparisons
 src/tdrp/utils/          Shared utilities
@@ -53,3 +57,5 @@ python -m pip install -e .[dev,rl]
 3. Create reproducible experiment entry points under `experiments/`.
 4. Add baseline heuristic policies.
 5. Add evaluation scripts for deterministic and uncertainty-shifted scenarios.
+
+See `docs/MODULAR_ENVIRONMENT.md` for the environment extension points.

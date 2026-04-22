@@ -52,6 +52,14 @@ class ScenarioGenerator:
     def generate(self, rng: np.random.Generator) -> Scenario:
         """Generate a full episode scenario (initial + scheduled future tasks)."""
         cfg = self.cfg
+        if cfg.scenario_data is not None or cfg.scenario_path:
+            from .scenario_io import load_scenario_json, scenario_from_dict
+
+            return (
+                load_scenario_json(cfg.scenario_path, cfg)
+                if cfg.scenario_path
+                else scenario_from_dict(cfg.scenario_data, cfg)
+            )
         spec = SCALE_CONFIGS[self._pick_scale(rng)]
         map_range = float(spec["map_range"])
         nstops = int(spec["nstops"])
@@ -60,12 +68,9 @@ class ScenarioGenerator:
         max_time_h = float(spec["max_time_h"])
         max_decisions = int(spec["max_decisions"])
 
-        if cfg.allow_dynamic_tasks and cfg.dynamic_task_ratio > 0.0:
-            npoint_future = int(round(npoint_init * float(cfg.dynamic_task_ratio)))
-            nline_future = int(round(nline_init * float(cfg.dynamic_task_ratio)))
-        else:
-            npoint_future = 0
-            nline_future = 0
+        npoint_future, nline_future = self._sample_future_task_counts(
+            rng, npoint_init, nline_init
+        )
 
         npoint = npoint_init + npoint_future
         nline = nline_init + nline_future
@@ -100,6 +105,7 @@ class ScenarioGenerator:
             task_priority = np.zeros(ntasks, dtype=np.int8)
             task_deadline_h = np.zeros(ntasks, dtype=np.float32)
             task_reward_weight = np.zeros(ntasks, dtype=np.float32)
+            task_urgency = np.zeros(ntasks, dtype=np.float32)
             task_service_factor = np.ones(ntasks, dtype=np.float32)
             task_risk = np.zeros(ntasks, dtype=np.float32)
 
@@ -114,11 +120,12 @@ class ScenarioGenerator:
                         continue
                     point_xy[i] = pt
                     service[i] = float(service_h)
-                    prio, ddl, rwt, sf, risk = self._sample_task_metadata(
+                    prio, ddl, rwt, urg, sf, risk = self._sample_task_metadata(
                         rng, 0.0, TASK_POINT, service_h, max_time_h)
                     task_priority[i] = prio
                     task_deadline_h[i] = ddl
                     task_reward_weight[i] = rwt
+                    task_urgency[i] = urg
                     task_service_factor[i] = sf
                     task_risk[i] = risk
                     found = True
@@ -133,7 +140,7 @@ class ScenarioGenerator:
                 anchor = stop_xy[int(rng.integers(0, nstops))]
                 found = False
                 for _ in range(cfg.scenario_max_task_retry):
-                    prio, ddl, rwt, sf, risk = self._sample_task_metadata(
+                    prio, ddl, rwt, urg, sf, risk = self._sample_task_metadata(
                         rng, 0.0, TASK_LINE, 0.0, max_time_h)
                     s_pos = self._sample_circle(rng, anchor, max_radius_ln, map_range)
                     poly = self._build_random_polyline(
@@ -152,6 +159,7 @@ class ScenarioGenerator:
                     task_priority[i] = prio
                     task_deadline_h[i] = ddl
                     task_reward_weight[i] = rwt
+                    task_urgency[i] = urg
                     task_service_factor[i] = sf
                     task_risk[i] = risk
                     found = True
@@ -163,16 +171,12 @@ class ScenarioGenerator:
                 continue
 
             task_spawn_time = np.zeros(ntasks, dtype=np.float32)
-            t_min = float(cfg.dynamic_spawn_t_min_frac) * max_time_h
-            t_max = float(cfg.dynamic_spawn_t_max_frac) * max_time_h
-            if t_max <= t_min:
-                t_max = max(t_min + 1e-3, max_time_h * 0.5)
-            if npoint_future > 0:
-                task_spawn_time[npoint_init:npoint] = rng.uniform(
-                    t_min, t_max, size=npoint_future).astype(np.float32)
-            if nline_future > 0:
-                task_spawn_time[npoint + nline_init:ntasks] = rng.uniform(
-                    t_min, t_max, size=nline_future).astype(np.float32)
+            task_spawn_time[npoint_init:npoint] = self._sample_spawn_times(
+                rng, npoint_future, max_time_h
+            )
+            task_spawn_time[npoint + nline_init:ntasks] = self._sample_spawn_times(
+                rng, nline_future, max_time_h
+            )
 
             return Scenario(
                 scale=next(k for k, v in SCALE_CONFIGS.items() if v is spec),
@@ -189,6 +193,7 @@ class ScenarioGenerator:
                 task_priority=task_priority,
                 task_deadline_h=task_deadline_h,
                 task_reward_weight=task_reward_weight,
+                task_urgency=task_urgency,
                 task_service_factor=task_service_factor,
                 task_risk=task_risk,
             )
@@ -340,10 +345,16 @@ class ScenarioGenerator:
         service_h: float,
         max_time_h: float,
     ) -> Tuple[int, float, float, float, float]:
-        """Return (priority, deadline_h, reward_weight, service_factor, risk)."""
+        """Return (priority, deadline_h, reward_weight, urgency, service_factor, risk)."""
         cfg = self.cfg
         priority = self._sample_task_priority(rng)
         base_weight = 1.0 + 0.45 * float(priority - 1) + (0.10 if int(task_type) == TASK_LINE else 0.0)
+        if float(cfg.task_weight_jitter_std) > 0.0:
+            base_weight = base_weight + rng.normal(0.0, float(cfg.task_weight_jitter_std))
+        reward_weight = float(
+            np.clip(base_weight, float(cfg.task_weight_min), float(cfg.task_weight_max))
+        )
+        urgency = self._sample_task_urgency(rng, priority)
         if int(task_type) == TASK_POINT:
             service_factor = 1.0
         else:
@@ -361,7 +372,51 @@ class ScenarioGenerator:
             slack_scale = max(0.20, 0.45 * float(service_factor))
         deadline_h = float(spawn_t_h + slack_frac * priority_tightness * slack_scale * float(max_time_h))
         deadline_h = float(np.clip(deadline_h, spawn_t_h + 1e-3, float(max_time_h)))
-        return int(priority), deadline_h, float(base_weight), float(service_factor), float(risk)
+        return int(priority), deadline_h, reward_weight, urgency, float(service_factor), float(risk)
+
+    def _sample_task_urgency(self, rng: np.random.Generator, priority: int) -> float:
+        ranges = {
+            1: self.cfg.normal_urgency_range,
+            2: self.cfg.urgent_urgency_range,
+            3: self.cfg.critical_urgency_range,
+        }
+        lo, hi = ranges.get(int(priority), self.cfg.normal_urgency_range)
+        lo = max(0.0, float(lo))
+        hi = max(lo, float(hi))
+        if bool(getattr(self.cfg, "task_urgency_random", False)):
+            return float(rng.uniform(lo, hi))
+        return float(0.5 * (lo + hi))
+
+    def _sample_future_task_counts(
+        self, rng: np.random.Generator, npoint_init: int, nline_init: int
+    ) -> Tuple[int, int]:
+        cfg = self.cfg
+        if not (cfg.allow_dynamic_tasks and cfg.dynamic_task_ratio > 0.0):
+            return 0, 0
+        process = str(cfg.dynamic_arrival_process).lower()
+        if process == "poisson":
+            npoint = int(rng.poisson(max(0.0, npoint_init * float(cfg.dynamic_task_ratio))))
+            nline = int(rng.poisson(max(0.0, nline_init * float(cfg.dynamic_task_ratio))))
+            return npoint, nline
+        return (
+            int(round(npoint_init * float(cfg.dynamic_task_ratio))),
+            int(round(nline_init * float(cfg.dynamic_task_ratio))),
+        )
+
+    def _sample_spawn_times(
+        self, rng: np.random.Generator, n: int, max_time_h: float
+    ) -> np.ndarray:
+        if n <= 0:
+            return np.zeros(0, dtype=np.float32)
+        cfg = self.cfg
+        t_min = float(cfg.dynamic_spawn_t_min_frac) * float(max_time_h)
+        t_max = float(cfg.dynamic_spawn_t_max_frac) * float(max_time_h)
+        if t_max <= t_min:
+            t_max = max(t_min + 1e-3, float(max_time_h) * 0.5)
+        # Conditional on the number of arrivals, a homogeneous Poisson process
+        # has arrival times distributed as sorted uniform order statistics.
+        times = rng.uniform(t_min, t_max, size=int(n))
+        return np.sort(times).astype(np.float32)
 
     def _sample_point_service_h(self, rng: np.random.Generator) -> float:
         if not self.cfg.heter_task_enabled:
@@ -422,10 +477,11 @@ class ScenarioGenerator:
         spawn_t_h: float,
         service_h: float = 0.0,
     ) -> None:
-        prio, ddl, rwt, sf, risk = self._sample_task_metadata(
+        prio, ddl, rwt, urg, sf, risk = self._sample_task_metadata(
             rng, spawn_t_h, task_type, service_h, float(scenario.max_time_h))
         scenario.task_priority[tid] = int(prio)
         scenario.task_deadline_h[tid] = float(ddl)
         scenario.task_reward_weight[tid] = float(rwt)
+        scenario.task_urgency[tid] = float(urg)
         scenario.task_service_factor[tid] = float(sf)
         scenario.task_risk[tid] = float(risk)
